@@ -49,6 +49,9 @@ type evm struct {
 	Client           *http.Client
 	blockScanQueue   *chanx.UnboundedChan[evmBlock]
 	LookbackInterval time.Duration // 回溯时每批入队的间隔，控制 RPC 调用速率；默认 500ms
+	retryMu          sync.Mutex
+	retryAttempts    map[int64]int         // 已重试次数，key 为批次起始高度；懒初始化
+	retryScheduled   map[int64]*time.Timer // 待重试批次，同一批次只保留一个 timer；懒初始化
 }
 
 type evmBlock struct {
@@ -211,7 +214,7 @@ func (e *evm) getBlockByNumber(a any) {
 	resp, err := e.Client.Do(req)
 	if err != nil {
 		conf.RecordFailure(e.Network)
-		e.blockScanQueue.In <- b
+		e.scheduleBlockRetry(b, 0)
 		log.Task.Warn("eth_getBlockByNumber Error sending request:", err)
 
 		return
@@ -222,20 +225,20 @@ func (e *evm) getBlockByNumber(a any) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		conf.RecordFailure(e.Network)
-		e.blockScanQueue.In <- b
+		e.scheduleBlockRetry(b, 0)
 		log.Task.Warn("eth_getBlockByNumber Error reading response body:", err)
 
 		return
 	}
 
-	conf.RecordSuccess(e.Network, cast.ToString(b.To))
-
+	// 注意：成功只在整批区块解析完成后记录。此处若提前 RecordSuccess，
+	// 后续 eth_getLogs 失败会让一次批次同时计入成功与失败，成功率显示失真。
 	nativeTransfers := make([]transfer, 0)
 	blockTimestamp := make(map[string]time.Time)
 	for _, itm := range gjson.ParseBytes(body).Array() {
 		if itm.Get("error").Exists() {
 			conf.RecordFailure(e.Network)
-			e.blockScanQueue.In <- b
+			e.scheduleBlockRetry(b, 0)
 			log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber response error %s", e.Network, itm.Get("error").String()))
 
 			return
@@ -256,11 +259,14 @@ func (e *evm) getBlockByNumber(a any) {
 	transfers, err := e.parseEventTransfer(b, blockTimestamp)
 	if err != nil {
 		conf.RecordFailure(e.Network)
-		e.blockScanQueue.In <- b
+		e.scheduleBlockRetry(b, 0)
 		log.Task.Warn("Evm Block Parse Error parsing block transfer:", err)
 
 		return
 	}
+
+	e.resetBlockRetry(b)
+	conf.RecordSuccess(e.Network, cast.ToString(b.To))
 
 	if len(nativeTransfers) > 0 {
 		transferQueue.In <- nativeTransfers
@@ -446,6 +452,82 @@ func (e *evm) tradeConfirmHandle(ctx context.Context) {
 func (e *evm) rpcEndpoint() string {
 
 	return model.Endpoint(model.Network(e.Network))
+}
+
+// scheduleBlockRetry 以退避延迟重新入队失败的批次。
+//
+// 原实现是失败后立即重新入队：当 RPC 节点对某类请求持续拒绝（例如公共节点
+// 对不带 address 过滤的全量 eth_getLogs 返回 limit exceeded）时，批次会在
+// 队列里无限打转，把请求量放大到每秒数十次，同时刷满 task.log。
+// 这里改为有界退避，并在堆积时延后重试，避免故障期间把队列灌满。
+func (e *evm) scheduleBlockRetry(b evmBlock, delay time.Duration) {
+	e.retryMu.Lock()
+	if e.retryScheduled == nil {
+		e.retryScheduled = make(map[int64]*time.Timer)
+	}
+	if e.retryAttempts == nil {
+		e.retryAttempts = make(map[int64]int)
+	}
+
+	if _, ok := e.retryScheduled[b.From]; ok {
+		e.retryMu.Unlock()
+
+		return
+	}
+
+	attempt := e.retryAttempts[b.From] + 1
+	e.retryAttempts[b.From] = attempt
+	if delay <= 0 {
+		delay = evmRetryDelay(attempt)
+	}
+
+	var timer *time.Timer
+	timer = time.AfterFunc(delay, func() {
+		e.retryMu.Lock()
+		if e.retryScheduled[b.From] != timer {
+			e.retryMu.Unlock()
+
+			return
+		}
+		delete(e.retryScheduled, b.From)
+		e.retryMu.Unlock()
+
+		if e.blockScanQueue.Len() >= blockQueueLimit {
+			log.Task.Warn(fmt.Sprintf("%s 重试延后，当前区块消费堆积数量：%d", e.Network, e.blockScanQueue.Len()))
+			e.scheduleBlockRetry(b, delay)
+
+			return
+		}
+
+		e.blockScanQueue.In <- b
+	})
+	e.retryScheduled[b.From] = timer
+	e.retryMu.Unlock()
+}
+
+// resetBlockRetry 在批次成功后清理重试状态，避免长期运行下 map 无限增长。
+func (e *evm) resetBlockRetry(b evmBlock) {
+	e.retryMu.Lock()
+	defer e.retryMu.Unlock()
+
+	delete(e.retryAttempts, b.From)
+	if timer, ok := e.retryScheduled[b.From]; ok {
+		timer.Stop()
+		delete(e.retryScheduled, b.From)
+	}
+}
+
+// evmRetryDelay 退避序列与 tron.go / solana.go 保持一致，便于统一排障。
+func evmRetryDelay(attempt int) time.Duration {
+	delays := [...]time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second, time.Minute}
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > len(delays) {
+		attempt = len(delays)
+	}
+
+	return delays[attempt-1]
 }
 
 func syncBreak(network string, num int) bool {
