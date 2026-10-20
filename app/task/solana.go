@@ -31,11 +31,16 @@ import (
 type solana struct {
 	slotConfirmedOffset int
 	lastSlotNum         int
+	forwardIdle         bool // 因没有待支付订单而暂停了向前扫描
 	slotQueue           *chanx.UnboundedChan[int]
 	client              *http.Client
 	retryMu             sync.Mutex
 	retryAttempts       map[int]int
 	retryScheduled      map[int]*time.Timer
+	lookbackMu          sync.Mutex
+	lookbackNext        int
+	lookbackEnd         int
+	lookbackOrderIDs    []int64
 }
 
 type solanaTokenOwner struct {
@@ -51,6 +56,7 @@ func init() {
 	Register(Task{Callback: sol.syncSlotForward, Duration: time.Second * 5})
 	Register(Task{Callback: sol.tradeConfirmHandle, Duration: time.Second * 5})
 	Register(Task{Callback: sol.lookbackSlots, Duration: time.Second * 15})
+	Register(Task{Callback: sol.reconcileExpiredOrders, Duration: time.Minute})
 }
 
 func newSolana() solana {
@@ -69,7 +75,10 @@ func solanaGetBlockPayload(slot int) []byte {
 }
 
 func (s *solana) syncSlotForward(ctx context.Context) {
-	if syncBreak(conf.Solana, s.slotQueue.Len()) {
+	if queued := s.slotQueue.Len(); syncBreak(conf.Solana, queued) {
+		if queued < blockQueueLimit {
+			s.forwardIdle = true
+		}
 
 		return
 	}
@@ -109,9 +118,14 @@ func (s *solana) syncSlotForward(ctx context.Context) {
 		return
 	}
 
-	if now-s.lastSlotNum > cast.ToInt(model.GetC(model.BlockHeightMaxDiff)) { // 区块高度变化过大，强制丢块重扫
-		s.lastSlotNum = now
+	if lag := now - s.lastSlotNum; lag > cast.ToInt(model.GetC(model.BlockHeightMaxDiff)) {
+		if s.lastSlotNum == 0 || s.forwardIdle { // 启动或空闲后恢复扫描：直接从最新高度开始
+			s.lastSlotNum = now
+		} else { // 扫描期间落后：继续追赶，不能跳过，其中可能有付款
+			log.Task.Warn(fmt.Sprintf("Solana 扫描落后 %d 个 slot，继续追赶", lag))
+		}
 	}
+	s.forwardIdle = false
 
 	if now <= s.lastSlotNum { // 区块高度没有变化或节点返回旧高度
 
@@ -160,7 +174,7 @@ func (s *solana) slotParse(n any) {
 	resp, err := s.client.Post(model.Endpoint(conf.Solana), "application/json", bytes.NewBuffer(post))
 	if err != nil {
 		conf.RecordFailure(network)
-		s.scheduleSlotRetry(slot, 0)
+		s.scheduleSlotRetry(slot)
 		log.Task.Warn("slotParse Error sending request:", err)
 
 		return
@@ -169,7 +183,7 @@ func (s *solana) slotParse(n any) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		conf.RecordFailure(network)
-		s.scheduleSlotRetry(slot, 0)
+		s.scheduleSlotRetry(slot)
 		log.Task.Warn("slotParse Error response status code:", resp.StatusCode)
 
 		return
@@ -178,7 +192,7 @@ func (s *solana) slotParse(n any) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		conf.RecordFailure(network)
-		s.scheduleSlotRetry(slot, 0)
+		s.scheduleSlotRetry(slot)
 		log.Task.Warn("slotParse Error reading response body:", err)
 
 		return
@@ -187,7 +201,7 @@ func (s *solana) slotParse(n any) {
 	result, err := validateSolanaBlockResponse(body)
 	if err != nil {
 		conf.RecordFailure(network)
-		s.scheduleSlotRetry(slot, 0)
+		s.scheduleSlotRetry(slot)
 		log.Task.Warn("slotParse Error JSON-RPC response:", err)
 
 		return
@@ -204,56 +218,82 @@ func (s *solana) slotParse(n any) {
 	timestamp := time.Unix(result.Get("blockTime").Int(), 0)
 
 	for _, trans := range result.Get("transactions").Array() {
-		hash := trans.Get("transaction.signatures.0").String()
+		if transfers := s.parseTransaction(trans, slot, timestamp); len(transfers) > 0 {
+			transferQueue.In <- transfers
+		}
+	}
 
-		// 解析账号索引
-		accountKeys := make([]string, 0)
-		for _, key := range trans.Get("transaction.message.accountKeys").Array() {
+	log.Task.Info(fmt.Sprintf("区块扫描完成(Solana) %d 成功率：%s", slot, conf.GetSuccessRate(network)))
+}
+
+// parseTransaction 解析单笔交易中的 USDT/USDC 转账；getBlock 返回的交易项与 getTransaction 的结果结构相同，都可以传入
+func (s *solana) parseTransaction(trans gjson.Result, slot int, timestamp time.Time) []transfer {
+	if !solanaTxSucceeded(trans.Get("meta.err")) {
+
+		return nil
+	}
+
+	hash := trans.Get("transaction.signatures.0").String()
+
+	// 解析账号索引
+	accountKeys := make([]string, 0)
+	for _, key := range trans.Get("transaction.message.accountKeys").Array() {
+		accountKeys = append(accountKeys, key.String())
+	}
+	for _, v := range []string{"readonly", "writable"} {
+		for _, key := range trans.Get("meta.loadedAddresses." + v).Array() {
 			accountKeys = append(accountKeys, key.String())
 		}
-		for _, v := range []string{"readonly", "writable"} {
-			for _, key := range trans.Get("meta.loadedAddresses." + v).Array() {
-				accountKeys = append(accountKeys, key.String())
+	}
+
+	// 查找SPL Token索引
+	splTokenIndex := int64(-1)
+	for i, v := range accountKeys {
+		if v == conf.SolSplToken {
+			splTokenIndex = int64(i)
+
+			break
+		}
+	}
+
+	// SPL Token的Mint地址，即不包含 Token 交易信息
+	if splTokenIndex == -1 {
+
+		return nil
+	}
+
+	// 解析 Token 账户 【Token Wallet => Owner Wallet】
+	tokenAccountMap := make(map[string]solanaTokenOwner)
+	for _, v := range []string{"postTokenBalances", "preTokenBalances"} {
+		for _, itm := range trans.Get("meta." + v).Array() {
+			tradeType, ok := model.GetContractTrade(itm.Get("mint").String())
+			if !ok || itm.Get("programId").String() != conf.SolSplToken {
+
+				continue
+			}
+
+			tokenAccountMap[accountKeys[itm.Get("accountIndex").Int()]] = solanaTokenOwner{
+				TradeType: tradeType,
+				Address:   itm.Get("owner").String(),
 			}
 		}
+	}
 
-		// 查找SPL Token索引
-		splTokenIndex := int64(-1)
-		for i, v := range accountKeys {
-			if v == conf.SolSplToken {
-				splTokenIndex = int64(i)
+	transArr := make([]transfer, 0)
 
-				break
-			}
-		}
-
-		// SPL Token的Mint地址，即不包含 Token 交易信息
-		if splTokenIndex == -1 {
+	// 解析外部指令
+	for _, instr := range trans.Get("transaction.message.instructions").Array() {
+		if instr.Get("programIdIndex").Int() != splTokenIndex {
 
 			continue
 		}
 
-		// 解析 Token 账户 【Token Wallet => Owner Wallet】
-		tokenAccountMap := make(map[string]solanaTokenOwner)
-		for _, v := range []string{"postTokenBalances", "preTokenBalances"} {
-			for _, itm := range trans.Get("meta." + v).Array() {
-				tradeType, ok := model.GetContractTrade(itm.Get("mint").String())
-				if !ok || itm.Get("programId").String() != conf.SolSplToken {
+		transArr = append(transArr, s.parseTransfer(instr, accountKeys, tokenAccountMap))
+	}
 
-					continue
-				}
-
-				tokenAccountMap[accountKeys[itm.Get("accountIndex").Int()]] = solanaTokenOwner{
-					TradeType: tradeType,
-					Address:   itm.Get("owner").String(),
-				}
-			}
-		}
-
-		transArr := make([]transfer, 0)
-
-		// 解析外部指令
-		for _, instr := range trans.Get("transaction.message.instructions").Array() {
+	// 解析内部指令
+	for _, itm := range trans.Get("meta.innerInstructions").Array() {
+		for _, instr := range itm.Get("instructions").Array() {
 			if instr.Get("programIdIndex").Int() != splTokenIndex {
 
 				continue
@@ -261,41 +301,35 @@ func (s *solana) slotParse(n any) {
 
 			transArr = append(transArr, s.parseTransfer(instr, accountKeys, tokenAccountMap))
 		}
-
-		// 解析内部指令
-		for _, itm := range trans.Get("meta.innerInstructions").Array() {
-			for _, instr := range itm.Get("instructions").Array() {
-				if instr.Get("programIdIndex").Int() != splTokenIndex {
-
-					continue
-				}
-
-				transArr = append(transArr, s.parseTransfer(instr, accountKeys, tokenAccountMap))
-			}
-		}
-
-		// 过滤无关交易
-		result := make([]transfer, 0)
-		for _, t := range transArr {
-			if t.FromAddress == "" || t.RecvAddress == "" || t.Amount.IsZero() {
-
-				continue
-			}
-
-			t.TxHash = hash
-			t.Network = conf.Solana
-			t.BlockNum = slot
-			t.Timestamp = timestamp
-
-			result = append(result, t)
-		}
-
-		if len(result) > 0 {
-			transferQueue.In <- result
-		}
 	}
 
-	log.Task.Info(fmt.Sprintf("区块扫描完成(Solana) %d 成功率：%s", slot, conf.GetSuccessRate(network)))
+	// 过滤无关交易
+	result := make([]transfer, 0)
+	for _, t := range transArr {
+		if t.FromAddress == "" || t.RecvAddress == "" || t.Amount.IsZero() {
+
+			continue
+		}
+
+		t.TxHash = hash
+		t.Network = conf.Solana
+		t.BlockNum = slot
+		t.Timestamp = timestamp
+
+		result = append(result, t)
+	}
+
+	return result
+}
+
+// 执行失败的交易同样会被打包进区块，指令和代币余额也照常保留，但转账已经回滚；只有 err 为 null 才算执行成功
+func solanaTxSucceeded(err gjson.Result) bool {
+	return err.Exists() && err.Type == gjson.Null
+}
+
+// getSignatureStatuses 对执行失败的交易同样返回 finalized，必须同时检查 err
+func solanaSignatureFinalized(status gjson.Result) bool {
+	return status.Get("confirmationStatus").String() == "finalized" && solanaTxSucceeded(status.Get("err"))
 }
 
 // Solana JSON-RPC 错误码，参考 https://github.com/anza-xyz/agave/blob/master/rpc-client-api/src/custom_error.rs
@@ -330,7 +364,7 @@ func validateSolanaBlockResponse(body []byte) (gjson.Result, error) {
 	return result, nil
 }
 
-func (s *solana) scheduleSlotRetry(slot int, delay time.Duration) {
+func (s *solana) scheduleSlotRetry(slot int) {
 	s.retryMu.Lock()
 	if _, ok := s.retryScheduled[slot]; ok {
 		s.retryMu.Unlock()
@@ -339,13 +373,18 @@ func (s *solana) scheduleSlotRetry(slot int, delay time.Duration) {
 	}
 
 	attempt := s.retryAttempts[slot] + 1
-	s.retryAttempts[slot] = attempt
-	if delay <= 0 {
-		delay = solanaRetryDelay(attempt)
-	}
+	if attempt > solanaSlotMaxRetries { // 放弃该 slot，否则向前扫描会一直暂停
+		delete(s.retryAttempts, slot)
+		s.retryMu.Unlock()
+		log.Task.Error(fmt.Sprintf("Solana slot %d 连续 %d 次扫描失败，已放弃，该 slot 内的付款需要人工核对", slot, solanaSlotMaxRetries))
 
+		return
+	}
+	s.retryAttempts[slot] = attempt
+
+	// 待重试的 slot 数量有限，到期直接入队；不再因队列堆积而延后，否则堆积会被计为失败次数
 	var timer *time.Timer
-	timer = time.AfterFunc(delay, func() {
+	timer = time.AfterFunc(solanaRetryDelay(attempt), func() {
 		s.retryMu.Lock()
 		if s.retryScheduled[slot] != timer {
 			s.retryMu.Unlock()
@@ -354,13 +393,6 @@ func (s *solana) scheduleSlotRetry(slot int, delay time.Duration) {
 		}
 		delete(s.retryScheduled, slot)
 		s.retryMu.Unlock()
-
-		if s.slotQueue.Len() >= blockQueueLimit {
-			log.Task.Warn("Solana 重试延后，当前区块消费堆积数量：", s.slotQueue.Len())
-			s.scheduleSlotRetry(slot, delay)
-
-			return
-		}
 
 		s.slotQueue.In <- slot
 	})
@@ -385,6 +417,9 @@ func (s *solana) pendingSlotRetryCount() int {
 
 	return len(s.retryAttempts)
 }
+
+// 单个 slot 最多重试 10 次，按 solanaRetryDelay 约 7 分钟
+const solanaSlotMaxRetries = 10
 
 func solanaRetryDelay(attempt int) time.Duration {
 	delays := [...]time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second, time.Minute}
@@ -453,15 +488,6 @@ func (s *solana) tradeConfirmHandle(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	var handle = func(o model.Order) {
-		if model.GetC(model.BlockOffsetConfirm) == "1" {
-			if s.lastSlotNum == 0 {
-				return
-			}
-			if s.lastSlotNum-o.RefBlockNum < s.slotConfirmedOffset {
-				return
-			}
-		}
-
 		post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses","params":[["%s"],{"searchTransactionHistory":true}]}`, o.RefHash))
 		req, _ := http.NewRequestWithContext(ctx, "POST", model.Endpoint(conf.Solana), bytes.NewBuffer(post))
 		resp, err := s.client.Do(req)
@@ -493,7 +519,13 @@ func (s *solana) tradeConfirmHandle(ctx context.Context) {
 			return
 		}
 
-		if data.Get("result.value.0.confirmationStatus").String() == "finalized" {
+		// 用同一响应里节点当前的 slot 计算确认数，不依赖向前扫描进度：扫描在没有待支付订单时会暂停，重启后为 0
+		if model.GetC(model.BlockOffsetConfirm) == "1" && data.Get("result.context.slot").Int()-int64(o.RefBlockNum) < int64(s.slotConfirmedOffset) {
+
+			return
+		}
+
+		if solanaSignatureFinalized(data.Get("result.value.0")) {
 
 			markFinalConfirmed(o)
 		}
@@ -516,22 +548,45 @@ func (s *solana) lookbackSlots(ctx context.Context) {
 		return
 	}
 
-	startAt, endAt, ok := getLookbackUnix(conf.Solana)
-	if !ok {
-		return
+	s.lookbackMu.Lock()
+	defer s.lookbackMu.Unlock()
+
+	if s.lookbackNext == 0 {
+		startAt, endAt, orderIDs, ok := pendingLookbackUnix(conf.Solana)
+		if !ok {
+			return
+		}
+
+		start, end := blockapi.New().GetBoundaryHeights(startAt, endAt, conf.Solana)
+		if !validSolanaLookbackRange(start, end) {
+			log.Task.Warn("Solana 回溯区块范围无效，稍后重试：", start, "-", end)
+
+			return
+		}
+
+		s.lookbackNext = int(start)
+		s.lookbackEnd = int(end)
+		s.lookbackOrderIDs = orderIDs
 	}
 
-	start, end := blockapi.New().GetBoundaryHeights(startAt, endAt, conf.Solana)
-	for i := int(start); i <= int(end); i++ {
+	for s.lookbackNext <= s.lookbackEnd && s.slotQueue.Len() < blockQueueLimit {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		if syncBreak(conf.Solana, s.slotQueue.Len()) {
-			return
-		}
-		s.slotQueue.In <- i
-		time.Sleep(time.Millisecond * 200)
+		s.slotQueue.In <- s.lookbackNext
+		s.lookbackNext++
 	}
+
+	if s.lookbackNext > s.lookbackEnd {
+		markLookbackDone(s.lookbackOrderIDs)
+		s.lookbackNext = 0
+		s.lookbackEnd = 0
+		s.lookbackOrderIDs = nil
+	}
+}
+
+func validSolanaLookbackRange(start, end int64) bool {
+	return start > 0 && end >= start
 }
