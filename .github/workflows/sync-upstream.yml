@@ -1,0 +1,47 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 3 * * *' # 每天 UTC 03:17（北京时间 11:17），避开整点高峰
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/v03413/BEpusdt.git
+          git fetch upstream main
+
+          BEFORE=$(git rev-parse HEAD)
+          git merge upstream/main --no-edit
+          AFTER=$(git rev-parse HEAD)
+
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo 'Already up to date, nothing to do.'
+            exit 0
+          fi
+
+          git push origin main
+          # GITHUB_TOKEN 的 push 不会触发其他 workflow，手动触发 GHCR 镜像构建
+          gh workflow run docker-ghcr.yml --ref main
