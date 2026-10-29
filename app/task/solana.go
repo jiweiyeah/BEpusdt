@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -37,6 +38,7 @@ type solana struct {
 	retryMu             sync.Mutex
 	retryAttempts       map[int]int
 	retryScheduled      map[int]*time.Timer
+	retryStopped        map[int]struct{}
 	lookbackMu          sync.Mutex
 	lookbackNext        int
 	lookbackEnd         int
@@ -67,6 +69,7 @@ func newSolana() solana {
 		client:              utils.NewHttpClient(),
 		retryAttempts:       make(map[int]int),
 		retryScheduled:      make(map[int]*time.Timer),
+		retryStopped:        make(map[int]struct{}),
 	}
 }
 
@@ -82,7 +85,7 @@ func (s *solana) syncSlotForward(ctx context.Context) {
 
 		return
 	}
-	if s.pendingSlotRetryCount() > 0 {
+	if s.pendingSlotRetryCount() >= solanaForwardPauseRetries {
 		return
 	}
 
@@ -199,6 +202,13 @@ func (s *solana) slotParse(n any) {
 	}
 
 	result, err := validateSolanaBlockResponse(body)
+	if errors.Is(err, errSolanaBlockCleanedUp) { // 节点已清理该 slot，重试也拿不到；放弃，不暂停向前扫描
+		conf.RecordFailure(network)
+		s.stopSlotRetry(slot)
+		log.Task.Error(fmt.Sprintf("Solana slot %d 已被节点清理，无法扫描，该 slot 内的付款需要人工核对：%s", slot, err))
+
+		return
+	}
 	if err != nil {
 		conf.RecordFailure(network)
 		s.scheduleSlotRetry(slot)
@@ -334,9 +344,13 @@ func solanaSignatureFinalized(status gjson.Result) bool {
 
 // Solana JSON-RPC 错误码，参考 https://github.com/anza-xyz/agave/blob/master/rpc-client-api/src/custom_error.rs
 const (
+	solanaErrBlockCleanedUp             = -32001
 	solanaErrSlotSkipped                = -32007
 	solanaErrLongTermStorageSlotSkipped = -32009
 )
+
+// 节点只保留最近一段时间的区块，更早的 slot 返回 -32001，换一个时间重试也不会有
+var errSolanaBlockCleanedUp = errors.New("block cleaned up")
 
 func validateSolanaBlockResponse(body []byte) (gjson.Result, error) {
 	if !gjson.ValidBytes(body) {
@@ -348,6 +362,8 @@ func validateSolanaBlockResponse(body []byte) (gjson.Result, error) {
 		switch rpcErr.Get("code").Int() {
 		case solanaErrSlotSkipped, solanaErrLongTermStorageSlotSkipped: // 被跳过的 slot 没有区块，按空 slot 处理
 			return gjson.Result{Type: gjson.Null}, nil
+		case solanaErrBlockCleanedUp:
+			return gjson.Result{}, fmt.Errorf("%w: %s", errSolanaBlockCleanedUp, rpcErr.Raw)
 		}
 
 		return gjson.Result{}, fmt.Errorf("RPC error: %s", rpcErr.Raw)
@@ -366,6 +382,11 @@ func validateSolanaBlockResponse(body []byte) (gjson.Result, error) {
 
 func (s *solana) scheduleSlotRetry(slot int) {
 	s.retryMu.Lock()
+	if _, stopped := s.retryStopped[slot]; stopped {
+		s.retryMu.Unlock()
+
+		return
+	}
 	if _, ok := s.retryScheduled[slot]; ok {
 		s.retryMu.Unlock()
 
@@ -400,6 +421,24 @@ func (s *solana) scheduleSlotRetry(slot int) {
 	s.retryMu.Unlock()
 }
 
+func (s *solana) stopSlotRetry(slot int) {
+	s.retryMu.Lock()
+	delete(s.retryAttempts, slot)
+	if timer, ok := s.retryScheduled[slot]; ok {
+		timer.Stop()
+		delete(s.retryScheduled, slot)
+	}
+	s.retryStopped[slot] = struct{}{}
+	s.retryMu.Unlock()
+
+	// 防止同一 slot 的并发请求在终态响应之后重新建立重试；并发请求结束后无需长期保留。
+	time.AfterFunc(time.Minute, func() {
+		s.retryMu.Lock()
+		delete(s.retryStopped, slot)
+		s.retryMu.Unlock()
+	})
+}
+
 func (s *solana) resetSlotRetry(slot int) {
 	s.retryMu.Lock()
 	defer s.retryMu.Unlock()
@@ -420,6 +459,10 @@ func (s *solana) pendingSlotRetryCount() int {
 
 // 单个 slot 最多重试 10 次，按 solanaRetryDelay 约 7 分钟
 const solanaSlotMaxRetries = 10
+
+// 待重试的 slot 达到这个数量，说明节点整体故障，暂停向前扫描，避免新 slot 不断进入重试；
+// 个别 slot 失败时继续向前扫描，否则一个 slot 的重试会让之后的付款最多等约 7 分钟
+const solanaForwardPauseRetries = 10
 
 func solanaRetryDelay(attempt int) time.Duration {
 	delays := [...]time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second, time.Minute}
@@ -544,12 +587,27 @@ func (s *solana) tradeConfirmHandle(ctx context.Context) {
 }
 
 func (s *solana) lookbackSlots(ctx context.Context) {
+	s.lookbackMu.Lock()
+	defer s.lookbackMu.Unlock()
+
+	// 回溯到一半时订单已支付、取消，或已超出回溯时间，剩余区间不再需要。扫描空闲时这里不会执行到下面，
+	// 不清空的话进度会一直保留，下一笔订单到来时接着扫这段旧 slot，节点可能早已清理
+	if s.lookbackNext != 0 {
+		pending, err := lookbackOrdersPending(s.lookbackOrderIDs)
+		if err != nil { // 查询失败不等于订单已结束，保留进度，下一轮再判断
+			log.Task.Warn("Solana 回溯订单查询失败，稍后重试：", err)
+
+			return
+		}
+		if !pending {
+			log.Task.Info(fmt.Sprintf("Solana 回溯的订单已不需要回溯，丢弃剩余回溯区间 %d-%d", s.lookbackNext, s.lookbackEnd))
+			s.resetLookback()
+		}
+	}
+
 	if syncBreak(conf.Solana, s.slotQueue.Len()) {
 		return
 	}
-
-	s.lookbackMu.Lock()
-	defer s.lookbackMu.Unlock()
 
 	if s.lookbackNext == 0 {
 		startAt, endAt, orderIDs, ok := pendingLookbackUnix(conf.Solana)
@@ -581,10 +639,14 @@ func (s *solana) lookbackSlots(ctx context.Context) {
 
 	if s.lookbackNext > s.lookbackEnd {
 		markLookbackDone(s.lookbackOrderIDs)
-		s.lookbackNext = 0
-		s.lookbackEnd = 0
-		s.lookbackOrderIDs = nil
+		s.resetLookback()
 	}
+}
+
+func (s *solana) resetLookback() {
+	s.lookbackNext = 0
+	s.lookbackEnd = 0
+	s.lookbackOrderIDs = nil
 }
 
 func validSolanaLookbackRange(start, end int64) bool {
